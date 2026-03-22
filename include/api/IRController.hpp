@@ -24,23 +24,6 @@ private:
         uint16_t rawLen;
         uint32_t gapBefore;
         uint8_t kHz;
-        uint8_t protocolId;
-        uint16_t address;
-        uint16_t command;
-        uint16_t extra;
-        uint16_t numberOfBits;
-        uint8_t flags;
-        bool hasDecodedFields;
-        bool hasDistanceWidthInfo;
-        char protocolName[24];
-        char decodedRawDataHex[24];
-        uint64_t decodedRawDataValue;
-        uint16_t headerMarkMicros;
-        uint16_t headerSpaceMicros;
-        uint16_t oneMarkMicros;
-        uint16_t oneSpaceMicros;
-        uint16_t zeroMarkMicros;
-        uint16_t zeroSpaceMicros;
     };
 
     uint8_t _receivePin;
@@ -55,7 +38,6 @@ private:
     bool captureFrame();
     bool waitForSession();
     bool loadSessionFromJson(JsonDocument& doc, String& errorMessage);
-    void populateFrameDebugData(IRFrame& frame);
     uint32_t getFrameDurationMicros(const IRFrame& frame) const;
     uint32_t getSessionDurationMicros() const;
     void appendDiagnostics(JsonDocument& doc) const;

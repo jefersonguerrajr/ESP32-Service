@@ -1,9 +1,7 @@
 #include "api/IRController.hpp"
 #include <ArduinoJson.h>
 #include <IRremote.hpp>
-#include <inttypes.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 constexpr uint8_t IRController::MAX_FRAMES;
 constexpr uint16_t IRController::MAX_RAW_LEN;
@@ -47,44 +45,6 @@ void IRController::clearSession() {
     _lastFrameDurationMicros = 0;
 }
 
-void IRController::populateFrameDebugData(IRFrame& frame) {
-    const char* protocolName = getProtocolString(IrReceiver.decodedIRData.protocol);
-
-    frame.protocolId = static_cast<uint8_t>(IrReceiver.decodedIRData.protocol);
-    frame.address = IrReceiver.decodedIRData.address;
-    frame.command = IrReceiver.decodedIRData.command;
-    frame.extra = IrReceiver.decodedIRData.extra;
-    frame.numberOfBits = IrReceiver.decodedIRData.numberOfBits;
-    frame.flags = IrReceiver.decodedIRData.flags;
-    frame.hasDecodedFields = IrReceiver.decodedIRData.protocol != UNKNOWN;
-    frame.hasDistanceWidthInfo = IrReceiver.decodedIRData.protocol == PULSE_DISTANCE || IrReceiver.decodedIRData.protocol == PULSE_WIDTH;
-    frame.decodedRawDataValue = static_cast<uint64_t>(IrReceiver.decodedIRData.decodedRawData);
-
-    if (frame.hasDistanceWidthInfo) {
-        frame.headerMarkMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.HeaderMarkMicros;
-        frame.headerSpaceMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.HeaderSpaceMicros;
-        frame.oneMarkMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.OneMarkMicros;
-        frame.oneSpaceMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.OneSpaceMicros;
-        frame.zeroMarkMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.ZeroMarkMicros;
-        frame.zeroSpaceMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.ZeroSpaceMicros;
-    } else {
-        frame.headerMarkMicros = 0;
-        frame.headerSpaceMicros = 0;
-        frame.oneMarkMicros = 0;
-        frame.oneSpaceMicros = 0;
-        frame.zeroMarkMicros = 0;
-        frame.zeroSpaceMicros = 0;
-    }
-
-    snprintf(frame.protocolName, sizeof(frame.protocolName), "%s", protocolName != nullptr ? protocolName : "UNKNOWN");
-    snprintf(
-        frame.decodedRawDataHex,
-        sizeof(frame.decodedRawDataHex),
-        "0x%llX",
-        static_cast<unsigned long long>(frame.decodedRawDataValue)
-    );
-}
-
 bool IRController::captureFrame() {
     uint32_t captureStartedAtMicros = micros();
 
@@ -101,7 +61,6 @@ bool IRController::captureFrame() {
     IRFrame& frame = _session[_sessionLen];
     frame.gapBefore = 0;
     frame.kHz = DEFAULT_KHZ;
-    populateFrameDebugData(frame);
 
     uint16_t count = IrReceiver.irparams.rawlen - 1;
     if (count > MAX_RAW_LEN) {
@@ -174,8 +133,6 @@ bool IRController::loadSessionFromJson(JsonDocument& doc, String& errorMessage) 
     clearSession();
 
     for (JsonObjectConst frameJson : frames) {
-        JsonObjectConst debugJson = frameJson["debug"].as<JsonObjectConst>();
-        JsonObjectConst distanceWidthJson = debugJson["distanceWidth"].as<JsonObjectConst>();
         JsonArrayConst rawValues = frameJson["raw"].as<JsonArrayConst>();
         if (rawValues.isNull() || rawValues.size() == 0) {
             clearSession();
@@ -193,41 +150,6 @@ bool IRController::loadSessionFromJson(JsonDocument& doc, String& errorMessage) 
         frame.gapBefore = frameJson["gapBefore"] | 0U;
         frame.kHz = sessionHasKHz ? sessionKHz : (frameJson["kHz"] | DEFAULT_KHZ);
         frame.rawLen = rawValues.size();
-        frame.protocolId = debugJson["protocolId"] | 0;
-        frame.address = debugJson["address"] | 0;
-        frame.command = debugJson["command"] | 0;
-        frame.extra = debugJson["extra"] | 0;
-        frame.numberOfBits = debugJson["numberOfBits"] | 0;
-        frame.flags = debugJson["flags"] | 0;
-        frame.hasDecodedFields = !debugJson.isNull();
-        frame.hasDistanceWidthInfo = !distanceWidthJson.isNull();
-        frame.protocolName[0] = '\0';
-        frame.decodedRawDataHex[0] = '\0';
-        frame.decodedRawDataValue = 0;
-        frame.headerMarkMicros = 0;
-        frame.headerSpaceMicros = 0;
-        frame.oneMarkMicros = 0;
-        frame.oneSpaceMicros = 0;
-        frame.zeroMarkMicros = 0;
-        frame.zeroSpaceMicros = 0;
-
-        if (!debugJson.isNull()) {
-            const char* protocolName = debugJson["protocol"] | "UNKNOWN";
-            const char* decodedRawDataHex = debugJson["decodedRawDataHex"] | "0x0";
-
-            snprintf(frame.protocolName, sizeof(frame.protocolName), "%s", protocolName);
-            snprintf(frame.decodedRawDataHex, sizeof(frame.decodedRawDataHex), "%s", decodedRawDataHex);
-            frame.decodedRawDataValue = strtoull(decodedRawDataHex, nullptr, 0);
-        }
-
-        if (!distanceWidthJson.isNull()) {
-            frame.headerMarkMicros = distanceWidthJson["headerMarkMicros"] | 0;
-            frame.headerSpaceMicros = distanceWidthJson["headerSpaceMicros"] | 0;
-            frame.oneMarkMicros = distanceWidthJson["oneMarkMicros"] | 0;
-            frame.oneSpaceMicros = distanceWidthJson["oneSpaceMicros"] | 0;
-            frame.zeroMarkMicros = distanceWidthJson["zeroMarkMicros"] | 0;
-            frame.zeroSpaceMicros = distanceWidthJson["zeroSpaceMicros"] | 0;
-        }
 
         uint16_t index = 0;
         for (JsonVariantConst rawValue : rawValues) {
@@ -400,9 +322,9 @@ void IRController::handleSend(WebServer& server) {
 
     JsonDocument responseDoc;
     responseDoc["message"] = "Sinal infravermelho enviado";
-    responseDoc["framesSent"] = _sessionLen;
-    responseDoc["session"]["kHz"] = _sessionLen > 0 ? _session[0].kHz : DEFAULT_KHZ;
-    appendDiagnostics(responseDoc);
+    JsonObject session = responseDoc["session"].to<JsonObject>();
+    session["frameCount"] = _sessionLen;
+    session["kHz"] = _sessionLen > 0 ? _session[0].kHz : DEFAULT_KHZ;
 
     String output;
     serializeJson(responseDoc, output);
@@ -434,37 +356,12 @@ void IRController::sendSessionResponse(WebServer& server) {
         const IRFrame& frame = _session[i];
         JsonObject frameObject = frames.add<JsonObject>();
         frameObject["gapBefore"] = frame.gapBefore;
-        frameObject["kHz"] = frame.kHz;
-        frameObject["rawLen"] = frame.rawLen;
-
-        JsonObject debug = frameObject["debug"].to<JsonObject>();
-        debug["protocol"] = frame.protocolName;
-        debug["protocolId"] = frame.protocolId;
-        debug["numberOfBits"] = frame.numberOfBits;
-        debug["flags"] = frame.flags;
-        debug["decodedRawDataHex"] = frame.decodedRawDataHex;
-        if (frame.hasDistanceWidthInfo) {
-            JsonObject distanceWidth = debug["distanceWidth"].to<JsonObject>();
-            distanceWidth["headerMarkMicros"] = frame.headerMarkMicros;
-            distanceWidth["headerSpaceMicros"] = frame.headerSpaceMicros;
-            distanceWidth["oneMarkMicros"] = frame.oneMarkMicros;
-            distanceWidth["oneSpaceMicros"] = frame.oneSpaceMicros;
-            distanceWidth["zeroMarkMicros"] = frame.zeroMarkMicros;
-            distanceWidth["zeroSpaceMicros"] = frame.zeroSpaceMicros;
-        }
-        if (frame.hasDecodedFields) {
-            debug["address"] = frame.address;
-            debug["command"] = frame.command;
-            debug["extra"] = frame.extra;
-        }
 
         JsonArray raw = frameObject["raw"].to<JsonArray>();
         for (uint16_t j = 0; j < frame.rawLen; j++) {
             raw.add(frame.raw[j]);
         }
     }
-
-    appendDiagnostics(doc);
 
     String output;
     serializeJson(doc, output);
