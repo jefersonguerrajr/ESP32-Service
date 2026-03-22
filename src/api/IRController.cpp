@@ -1,13 +1,24 @@
 #include "api/IRController.hpp"
 #include <ArduinoJson.h>
 #include <IRremote.hpp>
+#include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+constexpr uint8_t IRController::MAX_FRAMES;
+constexpr uint16_t IRController::MAX_RAW_LEN;
+constexpr uint32_t IRController::CAPTURE_TIMEOUT_MS;
+constexpr uint32_t IRController::SESSION_END_GAP_MS;
+constexpr uint8_t IRController::DEFAULT_KHZ;
+constexpr uint32_t IRController::DEFAULT_INTER_FRAME_GAP_MICROS;
 
 IRController::IRController(uint8_t receivePin, uint8_t sendPin)
     : _receivePin(receivePin),
       _sendPin(sendPin),
       _sessionLen(0),
-      _hasSession(false) {}
+    _hasSession(false),
+    _lastFrameStartedAtMicros(0),
+    _lastFrameDurationMicros(0) {}
 
 void IRController::begin() {
     IrReceiver.begin(_receivePin, DISABLE_LED_FEEDBACK);
@@ -23,11 +34,17 @@ void IRController::registerRoutes(WebServer& server) {
     server.on("/api/ir/send", HTTP_POST, [this, &server]() {
         handleSend(server);
     });
+
+    server.on("/api/ir/diagnostics", HTTP_GET, [this, &server]() {
+        handleDiagnostics(server);
+    });
 }
 
 void IRController::clearSession() {
     _sessionLen = 0;
     _hasSession = false;
+    _lastFrameStartedAtMicros = 0;
+    _lastFrameDurationMicros = 0;
 }
 
 void IRController::populateFrameDebugData(IRFrame& frame) {
@@ -40,17 +57,37 @@ void IRController::populateFrameDebugData(IRFrame& frame) {
     frame.numberOfBits = IrReceiver.decodedIRData.numberOfBits;
     frame.flags = IrReceiver.decodedIRData.flags;
     frame.hasDecodedFields = IrReceiver.decodedIRData.protocol != UNKNOWN;
+    frame.hasDistanceWidthInfo = IrReceiver.decodedIRData.protocol == PULSE_DISTANCE || IrReceiver.decodedIRData.protocol == PULSE_WIDTH;
+    frame.decodedRawDataValue = static_cast<uint64_t>(IrReceiver.decodedIRData.decodedRawData);
+
+    if (frame.hasDistanceWidthInfo) {
+        frame.headerMarkMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.HeaderMarkMicros;
+        frame.headerSpaceMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.HeaderSpaceMicros;
+        frame.oneMarkMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.OneMarkMicros;
+        frame.oneSpaceMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.OneSpaceMicros;
+        frame.zeroMarkMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.ZeroMarkMicros;
+        frame.zeroSpaceMicros = IrReceiver.decodedIRData.DistanceWidthTimingInfo.ZeroSpaceMicros;
+    } else {
+        frame.headerMarkMicros = 0;
+        frame.headerSpaceMicros = 0;
+        frame.oneMarkMicros = 0;
+        frame.oneSpaceMicros = 0;
+        frame.zeroMarkMicros = 0;
+        frame.zeroSpaceMicros = 0;
+    }
 
     snprintf(frame.protocolName, sizeof(frame.protocolName), "%s", protocolName != nullptr ? protocolName : "UNKNOWN");
     snprintf(
         frame.decodedRawDataHex,
         sizeof(frame.decodedRawDataHex),
         "0x%llX",
-        static_cast<unsigned long long>(IrReceiver.decodedIRData.decodedRawData)
+        static_cast<unsigned long long>(frame.decodedRawDataValue)
     );
 }
 
 bool IRController::captureFrame() {
+    uint32_t captureStartedAtMicros = micros();
+
     if ((IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) || IrReceiver.irparams.rawlen < 10) {
         IrReceiver.resume();
         return false;
@@ -62,8 +99,8 @@ bool IRController::captureFrame() {
     }
 
     IRFrame& frame = _session[_sessionLen];
-    frame.gapBefore = (uint32_t)IrReceiver.irparams.rawbuf[0] * MICROS_PER_TICK;
-    frame.kHz = 38;
+    frame.gapBefore = 0;
+    frame.kHz = DEFAULT_KHZ;
     populateFrameDebugData(frame);
 
     uint16_t count = IrReceiver.irparams.rawlen - 1;
@@ -77,8 +114,20 @@ bool IRController::captureFrame() {
     }
 
     frame.rawLen = count;
+    uint32_t currentFrameDurationMicros = getFrameDurationMicros(frame);
+    uint32_t reportedGapMicros = (uint32_t)IrReceiver.irparams.initialGapTicks * MICROS_PER_TICK;
+    if (_sessionLen > 0 && _lastFrameStartedAtMicros > 0) {
+        uint32_t elapsedSinceLastStart = captureStartedAtMicros - _lastFrameStartedAtMicros;
+        uint32_t measuredGapMicros = elapsedSinceLastStart > _lastFrameDurationMicros
+            ? elapsedSinceLastStart - _lastFrameDurationMicros
+            : 0;
+        frame.gapBefore = measuredGapMicros > 0 ? measuredGapMicros : reportedGapMicros;
+    }
+
     _sessionLen++;
     _hasSession = true;
+    _lastFrameStartedAtMicros = captureStartedAtMicros;
+    _lastFrameDurationMicros = currentFrameDurationMicros;
 
     IrReceiver.resume();
     return true;
@@ -108,6 +157,9 @@ bool IRController::waitForSession() {
 }
 
 bool IRController::loadSessionFromJson(JsonDocument& doc, String& errorMessage) {
+    JsonVariantConst sessionKHzVariant = doc["session"]["kHz"];
+    bool sessionHasKHz = !sessionKHzVariant.isNull();
+    uint8_t sessionKHz = sessionKHzVariant | DEFAULT_KHZ;
     JsonArrayConst frames = doc["session"]["frames"].as<JsonArrayConst>();
     if (frames.isNull() || frames.size() == 0) {
         errorMessage = "Campo 'session.frames' obrigatorio";
@@ -122,6 +174,8 @@ bool IRController::loadSessionFromJson(JsonDocument& doc, String& errorMessage) 
     clearSession();
 
     for (JsonObjectConst frameJson : frames) {
+        JsonObjectConst debugJson = frameJson["debug"].as<JsonObjectConst>();
+        JsonObjectConst distanceWidthJson = debugJson["distanceWidth"].as<JsonObjectConst>();
         JsonArrayConst rawValues = frameJson["raw"].as<JsonArrayConst>();
         if (rawValues.isNull() || rawValues.size() == 0) {
             clearSession();
@@ -137,17 +191,43 @@ bool IRController::loadSessionFromJson(JsonDocument& doc, String& errorMessage) 
 
         IRFrame& frame = _session[_sessionLen];
         frame.gapBefore = frameJson["gapBefore"] | 0U;
-        frame.kHz = frameJson["kHz"] | 38;
+        frame.kHz = sessionHasKHz ? sessionKHz : (frameJson["kHz"] | DEFAULT_KHZ);
         frame.rawLen = rawValues.size();
-        frame.protocolId = 0;
-        frame.address = 0;
-        frame.command = 0;
-        frame.extra = 0;
-        frame.numberOfBits = 0;
-        frame.flags = 0;
-        frame.hasDecodedFields = false;
+        frame.protocolId = debugJson["protocolId"] | 0;
+        frame.address = debugJson["address"] | 0;
+        frame.command = debugJson["command"] | 0;
+        frame.extra = debugJson["extra"] | 0;
+        frame.numberOfBits = debugJson["numberOfBits"] | 0;
+        frame.flags = debugJson["flags"] | 0;
+        frame.hasDecodedFields = !debugJson.isNull();
+        frame.hasDistanceWidthInfo = !distanceWidthJson.isNull();
         frame.protocolName[0] = '\0';
         frame.decodedRawDataHex[0] = '\0';
+        frame.decodedRawDataValue = 0;
+        frame.headerMarkMicros = 0;
+        frame.headerSpaceMicros = 0;
+        frame.oneMarkMicros = 0;
+        frame.oneSpaceMicros = 0;
+        frame.zeroMarkMicros = 0;
+        frame.zeroSpaceMicros = 0;
+
+        if (!debugJson.isNull()) {
+            const char* protocolName = debugJson["protocol"] | "UNKNOWN";
+            const char* decodedRawDataHex = debugJson["decodedRawDataHex"] | "0x0";
+
+            snprintf(frame.protocolName, sizeof(frame.protocolName), "%s", protocolName);
+            snprintf(frame.decodedRawDataHex, sizeof(frame.decodedRawDataHex), "%s", decodedRawDataHex);
+            frame.decodedRawDataValue = strtoull(decodedRawDataHex, nullptr, 0);
+        }
+
+        if (!distanceWidthJson.isNull()) {
+            frame.headerMarkMicros = distanceWidthJson["headerMarkMicros"] | 0;
+            frame.headerSpaceMicros = distanceWidthJson["headerSpaceMicros"] | 0;
+            frame.oneMarkMicros = distanceWidthJson["oneMarkMicros"] | 0;
+            frame.oneSpaceMicros = distanceWidthJson["oneSpaceMicros"] | 0;
+            frame.zeroMarkMicros = distanceWidthJson["zeroMarkMicros"] | 0;
+            frame.zeroSpaceMicros = distanceWidthJson["zeroSpaceMicros"] | 0;
+        }
 
         uint16_t index = 0;
         for (JsonVariantConst rawValue : rawValues) {
@@ -161,16 +241,123 @@ bool IRController::loadSessionFromJson(JsonDocument& doc, String& errorMessage) 
     return _hasSession;
 }
 
-void IRController::transmitSession() {
+uint32_t IRController::getFrameDurationMicros(const IRFrame& frame) const {
+    uint32_t durationMicros = 0;
+    for (uint16_t i = 0; i < frame.rawLen; i++) {
+        durationMicros += frame.raw[i];
+    }
+
+    return durationMicros;
+}
+
+uint32_t IRController::getSessionDurationMicros() const {
+    uint32_t totalMicros = 0;
     for (uint8_t i = 0; i < _sessionLen; i++) {
-        IRFrame& frame = _session[i];
+        totalMicros += _session[i].gapBefore;
+        totalMicros += getFrameDurationMicros(_session[i]);
+    }
+
+    return totalMicros;
+}
+
+void IRController::appendDiagnostics(JsonDocument& doc) const {
+    JsonObject diagnostics = doc["diagnostics"].to<JsonObject>();
+    diagnostics["frameCount"] = _sessionLen;
+    diagnostics["sessionDurationMicros"] = getSessionDurationMicros();
+    diagnostics["sessionDurationMillis"] = getSessionDurationMicros() / 1000.0;
+
+    JsonArray frames = diagnostics["frames"].to<JsonArray>();
+    uint32_t replayOffsetMicros = 0;
+    for (uint8_t i = 0; i < _sessionLen; i++) {
+        const IRFrame& frame = _session[i];
+        uint32_t frameDurationMicros = getFrameDurationMicros(frame);
+
+        JsonObject frameDiag = frames.add<JsonObject>();
+        frameDiag["index"] = i;
+        frameDiag["gapBefore"] = frame.gapBefore;
+        frameDiag["durationMicros"] = frameDurationMicros;
+        frameDiag["durationMillis"] = frameDurationMicros / 1000.0;
+        frameDiag["replayStartOffsetMicros"] = replayOffsetMicros + frame.gapBefore;
+        frameDiag["carrierKHz"] = frame.kHz;
+        frameDiag["rawLen"] = frame.rawLen;
+
+        replayOffsetMicros += frame.gapBefore + frameDurationMicros;
+    }
+}
+
+bool IRController::isContinuationChunk(const IRFrame& frame) const {
+    // A continuation chunk has no proper protocol header.
+    // Real headers have long marks (>3000us, e.g. NEC ~9000us).
+    // Continuation chunks start with data-bit-sized marks (~500-700us).
+    if (frame.rawLen < 2) return false;
+    return frame.raw[0] < 3000;
+}
+
+void IRController::waitGapMicros(uint32_t gapMicros) {
+    if (gapMicros == 0) {
+        return;
+    }
+
+    uint32_t gapMillis = gapMicros / 1000;
+    uint32_t remainingMicros = gapMicros % 1000;
+
+    if (gapMillis > 0) {
+        delay(gapMillis);
+    }
+
+    if (remainingMicros > 0) {
+        delayMicroseconds(remainingMicros);
+    }
+}
+
+void IRController::transmitSession() {
+    uint16_t combinedRaw[MAX_RAW_LEN];
+
+    for (uint8_t i = 0; i < _sessionLen; ) {
+        const IRFrame& frame = _session[i];
 
         if (i > 0) {
-            uint32_t gapMs = frame.gapBefore / 1000;
-            delay((gapMs > 5 && gapMs < 300) ? gapMs : 40);
+            waitGapMicros(frame.gapBefore > 0 ? frame.gapBefore : DEFAULT_INTER_FRAME_GAP_MICROS);
         }
 
-        IrSender.sendRaw(frame.raw, frame.rawLen, frame.kHz);
+        // Copy first frame's raw data into combined buffer
+        uint16_t combinedLen = 0;
+        for (uint16_t j = 0; j < frame.rawLen && combinedLen < MAX_RAW_LEN; j++) {
+            combinedRaw[combinedLen++] = frame.raw[j];
+        }
+
+        uint8_t lastIndex = i;
+
+        // Append any continuation chunks (frames without a proper long header)
+        while ((lastIndex + 1) < _sessionLen && isContinuationChunk(_session[lastIndex + 1])) {
+            const IRFrame& nextFrame = _session[lastIndex + 1];
+
+            // Insert the inter-frame gap as a space between the trailing mark
+            // of the previous frame and the first mark of the continuation
+            if (combinedLen < MAX_RAW_LEN) {
+                uint16_t gapSpace;
+                if (nextFrame.gapBefore > 0 && nextFrame.gapBefore <= 65535) {
+                    gapSpace = (uint16_t)nextFrame.gapBefore;
+                } else if (nextFrame.gapBefore > 65535) {
+                    gapSpace = 65535;
+                } else {
+                    // gapBefore unknown (0) - use RECORD_GAP_MICROS as minimum
+                    // since separate captures require gap > RECORD_GAP_MICROS
+                    gapSpace = RECORD_GAP_MICROS;
+                }
+                combinedRaw[combinedLen++] = gapSpace;
+            }
+
+            // Append continuation frame's raw data
+            for (uint16_t j = 0; j < nextFrame.rawLen && combinedLen < MAX_RAW_LEN; j++) {
+                combinedRaw[combinedLen++] = nextFrame.raw[j];
+            }
+
+            lastIndex++;
+        }
+
+        IrSender.sendRaw(combinedRaw, combinedLen, frame.kHz);
+        i = lastIndex + 1;
     }
 
     IrReceiver.restartAfterSend();
@@ -214,9 +401,25 @@ void IRController::handleSend(WebServer& server) {
     JsonDocument responseDoc;
     responseDoc["message"] = "Sinal infravermelho enviado";
     responseDoc["framesSent"] = _sessionLen;
+    responseDoc["session"]["kHz"] = _sessionLen > 0 ? _session[0].kHz : DEFAULT_KHZ;
+    appendDiagnostics(responseDoc);
 
     String output;
     serializeJson(responseDoc, output);
+    server.send(200, "application/json", output);
+}
+
+void IRController::handleDiagnostics(WebServer& server) {
+    if (!_hasSession || _sessionLen == 0) {
+        server.send(404, "application/json", "{\"error\":\"Nenhuma sessao IR carregada\"}");
+        return;
+    }
+
+    JsonDocument doc;
+    appendDiagnostics(doc);
+
+    String output;
+    serializeJson(doc, output);
     server.send(200, "application/json", output);
 }
 
@@ -224,6 +427,7 @@ void IRController::sendSessionResponse(WebServer& server) {
     JsonDocument doc;
     JsonObject session = doc["session"].to<JsonObject>();
     session["frameCount"] = _sessionLen;
+    session["kHz"] = _sessionLen > 0 ? _session[0].kHz : DEFAULT_KHZ;
 
     JsonArray frames = session["frames"].to<JsonArray>();
     for (uint8_t i = 0; i < _sessionLen; i++) {
@@ -239,6 +443,15 @@ void IRController::sendSessionResponse(WebServer& server) {
         debug["numberOfBits"] = frame.numberOfBits;
         debug["flags"] = frame.flags;
         debug["decodedRawDataHex"] = frame.decodedRawDataHex;
+        if (frame.hasDistanceWidthInfo) {
+            JsonObject distanceWidth = debug["distanceWidth"].to<JsonObject>();
+            distanceWidth["headerMarkMicros"] = frame.headerMarkMicros;
+            distanceWidth["headerSpaceMicros"] = frame.headerSpaceMicros;
+            distanceWidth["oneMarkMicros"] = frame.oneMarkMicros;
+            distanceWidth["oneSpaceMicros"] = frame.oneSpaceMicros;
+            distanceWidth["zeroMarkMicros"] = frame.zeroMarkMicros;
+            distanceWidth["zeroSpaceMicros"] = frame.zeroSpaceMicros;
+        }
         if (frame.hasDecodedFields) {
             debug["address"] = frame.address;
             debug["command"] = frame.command;
@@ -250,6 +463,8 @@ void IRController::sendSessionResponse(WebServer& server) {
             raw.add(frame.raw[j]);
         }
     }
+
+    appendDiagnostics(doc);
 
     String output;
     serializeJson(doc, output);
